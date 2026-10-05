@@ -16,9 +16,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -59,7 +59,7 @@ jobs:
 
       - name: Upload the screenshot
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: home-page-windows
           path: ${{ runner.temp }}/home-page-windows.png
@@ -78,10 +78,10 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Script works with the oldest supported Python (3.8)
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.8'
       - run: python -m py_compile freetube_home.py tests/home_page_test.py
@@ -107,7 +107,7 @@ jobs:
 
       - name: Upload the screenshot
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: home-page-linux
           path: ${{ runner.temp }}/home-page-linux.png

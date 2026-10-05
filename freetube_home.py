@@ -206,8 +206,12 @@ def find_cookie_db(browser, profile):
         raise FeedError(f"no browser cookies in {profile}")
     found = cookie_dbs(browser)
     if not found:
-        raise FeedError(f"no {'supported browser' if browser == 'auto' else browser} profile found;"
-                        " pass --browser or --profile DIR")
+        if browser == "auto":
+            raise FeedError("no supported browser with a YouTube login was found. Sign in on youtube.com"
+                            " in Firefox, Zen, LibreWolf" + ("" if WINDOWS else ", Chrome, Brave")
+                            + " or another supported browser, then click Refresh (see the README).")
+        raise FeedError(f"no {browser} profile found; sign in on youtube.com in {browser} first,"
+                        " or pass --profile DIR")
     # The most recently written profile is the one you actually use; with
     # several browsers, the most recent one that is logged in to YouTube.
     found.sort(key=lambda f: os.path.getmtime(f[1]), reverse=True)
@@ -1856,7 +1860,7 @@ def check(args):
         print(f"FreeTube:           Flatpak ({FLATPAK_ID})")
     else:
         print(f"FreeTube:           {command[0]}")
-    entry = "Start-menu shortcut" if WINDOWS else "app-menu entry"
+    entry = "Start menu" if WINDOWS else "app-menu entry"
     print(f"{entry + ':':<20}{'installed' if launcher_installed() else 'not installed (run --install-launcher)'}")
     sys.exit(0 if ok else 1)
 
