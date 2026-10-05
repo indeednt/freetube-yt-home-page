@@ -1,0 +1,121 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    # A fresh Windows machine: install FreeTube, run install.ps1 in Windows'
+    # own PowerShell 5.1, start FreeTube through the "FreeTube Home" Start-menu
+    # shortcut and check that the Home page appears in it.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install FreeTube (per user, silently)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh api 'repos/FreeTubeApp/FreeTube/releases?per_page=1' | ConvertFrom-Json
+          $asset = $release[0].assets | Where-Object name -like '*-setup-x64.exe' | Select-Object -First 1
+          Write-Host "FreeTube $($release[0].tag_name): $($asset.name)"
+          Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile "$env:RUNNER_TEMP\freetube-setup.exe"
+          Start-Process "$env:RUNNER_TEMP\freetube-setup.exe" -ArgumentList '/S', '/currentuser' -Wait
+          Get-ChildItem "$env:LOCALAPPDATA\Programs\FreeTube\FreeTube.exe", "$env:ProgramFiles\FreeTube\FreeTube.exe" -ErrorAction SilentlyContinue
+
+      - name: Run install.ps1 (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+
+      - name: Check what was installed
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\freetube-yt-home-page"
+          $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\FreeTube Home.lnk"
+          foreach ($p in "$dir\freetube_home.py", "$dir\yt-dlp", $lnk) {
+            if (-not (Test-Path $p)) { throw "missing: $p" }
+            Write-Host "ok: $p"
+          }
+          $s = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
+          Write-Host "shortcut: $($s.TargetPath) $($s.Arguments)"
+          if ($s.TargetPath -notlike '*pythonw.exe') { throw 'the shortcut should start pythonw.exe' }
+
+      - name: Start FreeTube from the Start-menu shortcut and check the Home page
+        shell: pwsh
+        run: |
+          Start-Process "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\FreeTube Home.lnk"
+          python tests/home_page_test.py "$env:LOCALAPPDATA\freetube-yt-home-page" "$env:RUNNER_TEMP\home-page-windows.png"
+
+      - name: Upload the screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: home-page-windows
+          path: ${{ runner.temp }}/home-page-windows.png
+          if-no-files-found: ignore
+
+      - name: Run uninstall.ps1
+        if: always()
+        shell: powershell
+        run: |
+          Stop-Process -Name FreeTube -Force -ErrorAction SilentlyContinue
+          Start-Sleep 2
+          powershell -NoProfile -ExecutionPolicy Bypass -File uninstall.ps1
+          if (Test-Path "$env:LOCALAPPDATA\freetube-yt-home-page") { throw 'uninstall left files behind' }
+
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Script works with the oldest supported Python (3.8)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - run: python -m py_compile freetube_home.py tests/home_page_test.py
+
+      - name: Install FreeTube (.deb)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh api 'repos/FreeTubeApp/FreeTube/releases?per_page=1' -q '.[0].assets[] | select(.name|endswith("_amd64.deb")) | .browser_download_url')
+          curl -fsSL "$url" -o "$RUNNER_TEMP/freetube.deb"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "$RUNNER_TEMP/freetube.deb" xvfb
+
+      - name: Run install.sh
+        run: sh install.sh
+
+      - name: Start FreeTube from the app-menu entry and check the Home page
+        run: |
+          entry=$(grep -l '^X-FreeTube-Home-Launcher=true' ~/.local/share/applications/*.desktop)
+          cmd=$(sed -n 's/^Exec=//p' "$entry" | sed 's/ %u$//')
+          echo "app-menu entry runs: $cmd"
+          xvfb-run -a sh -c "$cmd & python3 tests/home_page_test.py ~/.local/share/freetube-yt-home-page \"$RUNNER_TEMP/home-page-linux.png\""
+
+      - name: Upload the screenshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: home-page-linux
+          path: ${{ runner.temp }}/home-page-linux.png
+          if-no-files-found: ignore
+
+      - name: Run uninstall.sh
+        if: always()
+        run: |
+          pkill -x freetube || true
+          sh uninstall.sh
+          test ! -e ~/.local/share/freetube-yt-home-page
