@@ -1375,23 +1375,23 @@ def free_port():
         return s.getsockname()[1]
 
 
-def find_devtools_page(port, proc, timeout=60):
-    """WebSocket URL of FreeTube's main window, once DevTools is up."""
-    started = time.time()
-    while time.time() - started < timeout and proc.poll() is None:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as r:
-                targets = json.load(r)
-        except (OSError, ValueError):
-            targets = []
-        pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
-        main = [t for t in pages if "index.html" in t.get("url", "")]
-        if main:
-            return main[0]["webSocketDebuggerUrl"]
-        if pages and time.time() - started > 20:  # FreeTube changed how it loads; take what's there
-            return pages[0]["webSocketDebuggerUrl"]
-        time.sleep(0.5)
-    return None
+def devtools_windows(port):
+    """{target id: WebSocket URL} of FreeTube's windows."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as r:
+            targets = json.load(r)
+    except (OSError, ValueError):
+        return None  # DevTools isn't up (yet)
+    pages = [t for t in targets if t.get("type") == "page" and t.get("webSocketDebuggerUrl")]
+    return {t["id"]: t["webSocketDebuggerUrl"] for t in pages if "index.html" in t.get("url", "")}, pages
+
+
+class Window:
+    """One FreeTube window: its own DevTools connection and its own chip."""
+
+    def __init__(self, session):
+        self.session = session
+        self.chip = ""  # the feed this window's page shows
 
 
 class HomeLauncher:
@@ -1401,10 +1401,10 @@ class HomeLauncher:
 
     def __init__(self, args, command, proc):
         self.args, self.command, self.proc = args, command, proc
-        self.session = None
+        self.windows = {}  # DevTools target id -> Window; every FreeTube window gets the page
+        self.attached = set()  # target ids with a connection running (or being set up)
         self.home = None  # the HomeSession that the chips come from
         self.chips = []
-        self.chip = ""  # the feed the page shows
         self.feeds = {}  # key -> {"videos", "fetchedAt"}
         self.streams = {}  # key -> FeedStream, to continue that feed
         self.fetching = set()  # keys being loaded
@@ -1420,29 +1420,30 @@ class HomeLauncher:
         except (OSError, ValueError, KeyError, TypeError):
             pass
 
-    def push(self, msg):
-        session = self.session
-        if not session:
-            return
+    def push(self, window, msg):
         expression = f"window.__ftHome && window.__ftHome.receive({json.dumps(msg)})"
         try:
-            session.call("Runtime.evaluate", {"expression": expression})
+            window.session.call("Runtime.evaluate", {"expression": expression})
         except OSError as e:
-            log(f"could not reach FreeTube: {e}")
+            log(f"could not reach a FreeTube window: {e}")
 
-    def push_feed(self):
-        key = self.chip
+    def showing(self, key):
+        """The windows whose page shows this chip's feed."""
+        return [w for w in list(self.windows.values()) if w.chip == key]
+
+    def push_feed(self, window):
+        key = window.chip
         feed = self.feeds.get(key) or {}
-        self.push({"type": "feed", "chip": key, "chips": self.chips, "videos": feed.get("videos"),
-                   "fetchedAt": feed.get("fetchedAt", 0), "loading": key in self.fetching})
+        self.push(window, {"type": "feed", "chip": key, "chips": self.chips, "videos": feed.get("videos"),
+                           "fetchedAt": feed.get("fetchedAt", 0), "loading": key in self.fetching})
 
     def feed_is_stale(self, key):
         feed = self.feeds.get(key)
         return not feed or time.time() - feed["fetchedAt"] / 1000 > STALE_FEED_SECONDS
 
-    def select(self, key):
-        self.chip = key
-        self.push_feed()
+    def select(self, window, key):
+        window.chip = key
+        self.push_feed(window)
         if self.feed_is_stale(key):
             self._start_fetch(key, more=False, fresh=False)
 
@@ -1457,8 +1458,8 @@ class HomeLauncher:
             if key in self.fetching:
                 return
             self.fetching.add(key)
-        if key == self.chip:
-            self.push({"type": "loading", "chip": key, "loading": True, "more": more})
+        for window in self.showing(key):
+            self.push(window, {"type": "loading", "chip": key, "loading": True, "more": more})
         threading.Thread(target=self._fetch, args=(key, more, fresh), daemon=True).start()
 
     def _new_stream(self, yt_dlp, key, fresh):
@@ -1536,16 +1537,17 @@ class HomeLauncher:
                 self.fetching.discard(key)
         if error:
             log(f"fetch failed: {error}")
-        if key != self.chip:
-            return  # the page has moved on to another chip; this one is kept for later
-        if error:
-            self.push({"type": "error", "chip": key, "chips": self.chips, "message": error, "more": more})
-        elif more:
-            self.push({"type": "append", "chip": key, "videos": videos})
-        else:
-            self.push_feed()
+        # Windows that have moved on to another chip get nothing: the feed is kept for later.
+        for window in self.showing(key):
+            if error:
+                self.push(window, {"type": "error", "chip": key, "chips": self.chips, "message": error,
+                                   "more": more})
+            elif more:
+                self.push(window, {"type": "append", "chip": key, "videos": videos})
+            else:
+                self.push_feed(window)
 
-    def on_message(self, msg):
+    def on_message(self, window, msg):
         params = msg.get("params") or {}
         if msg.get("method") == "Runtime.bindingCalled" and params.get("name") == BRIDGE:
             try:
@@ -1557,12 +1559,12 @@ class HomeLauncher:
             if kind == "ready":
                 # A freshly loaded page starts on "All". Nothing is fetched yet:
                 # YouTube is only contacted as you once the Home page is opened.
-                self.chip = ""
-                self.push_feed()
+                window.chip = ""
+                self.push_feed(window)
             elif kind == "chip":
-                self.select(key)
+                self.select(window, key)
             elif kind == "refresh":
-                self.chip = key
+                window.chip = key
                 self.refresh(key)
             elif kind == "more":
                 self.load_more(key)
@@ -1574,25 +1576,57 @@ class HomeLauncher:
         elif "error" in msg:
             log(f"DevTools error: {msg['error']}")
 
-    def run_session(self, ws_url):
-        session = DevTools(ws_url)
+    def run_window(self, target_id, ws_url):
+        """Add the page to one FreeTube window and serve it until the window closes."""
+        try:
+            session = DevTools(ws_url)
+        except (OSError, ConnectionError) as e:
+            log(f"could not attach to a FreeTube window: {e}")
+            time.sleep(2)  # retried on the next scan
+            self.attached.discard(target_id)
+            return
+        window = Window(session)
         script = (HOME_PAGE_JS.replace("%BRIDGE%", json.dumps(BRIDGE))
                   .replace("%STALE_MS%", str(STALE_FEED_SECONDS * 1000)))
-        session.call("Runtime.enable")
-        session.call("Page.enable")
-        session.call("Runtime.addBinding", {"name": BRIDGE})
-        session.call("Page.addScriptToEvaluateOnNewDocument", {"source": script})  # reloads
-        session.call("Runtime.evaluate", {"expression": script})  # the page already open
-        self.session = session
-        log("Home page added to FreeTube")
         try:
+            session.call("Runtime.enable")
+            session.call("Page.enable")
+            session.call("Runtime.addBinding", {"name": BRIDGE})
+            session.call("Page.addScriptToEvaluateOnNewDocument", {"source": script})  # reloads
+            session.call("Runtime.evaluate", {"expression": script})  # the page already open
+            self.windows[target_id] = window
+            log(f"Home page added to FreeTube ({len(self.windows)} window{'s' * (len(self.windows) > 1)})")
             while self.proc.poll() is None:
                 msg = session.receive(1.0)
                 if msg:
-                    self.on_message(msg)
+                    self.on_message(window, msg)
+        except (OSError, ConnectionError, ValueError):
+            pass  # the window was closed
         finally:
-            self.session = None
+            self.windows.pop(target_id, None)
+            self.attached.discard(target_id)
             session.close()
+
+    def run(self, port):
+        """Give every FreeTube window the page, including ones opened later."""
+        started, ever = time.time(), False
+        while self.proc.poll() is None:
+            found = devtools_windows(port)
+            if found is not None:
+                windows, pages = found
+                if not windows and pages and not ever and time.time() - started > 20:
+                    # FreeTube changed how it loads its windows: take what's there
+                    windows = {t["id"]: t["webSocketDebuggerUrl"] for t in pages}
+                for target_id, ws_url in windows.items():
+                    if target_id not in self.attached:
+                        self.attached.add(target_id)
+                        ever = True
+                        threading.Thread(target=self.run_window, args=(target_id, ws_url),
+                                         daemon=True).start()
+            if not ever and time.time() - started > 60:
+                log("FreeTube did not open DevTools; it runs normally, without the Home page")
+                return
+            time.sleep(1)
 
 
 UPDATE_STAMP = os.path.join(CACHE_DIR, "yt-dlp-update-check")
@@ -1642,18 +1676,9 @@ def launch(args):
     log(f"started FreeTube (DevTools on 127.0.0.1:{port})")
     update_yt_dlp_daily()  # while FreeTube is still starting up
     log(f"using {find_yt_dlp()}")
-    launcher = HomeLauncher(args, command, proc)
-    while proc.poll() is None:
-        ws_url = find_devtools_page(port, proc)
-        if not ws_url:
-            log("FreeTube did not open DevTools; it runs normally, without the Home page")
-            return
-        try:
-            launcher.run_session(ws_url)
-        except (OSError, ConnectionError, ValueError) as e:
-            log(f"DevTools session ended: {e}")
-            time.sleep(1)
-    log("FreeTube closed")
+    HomeLauncher(args, command, proc).run(port)
+    if proc.poll() is not None:
+        log("FreeTube closed")
 
 
 # --- App-menu entry ------------------------------------------------------------
